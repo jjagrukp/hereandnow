@@ -1,0 +1,558 @@
+var express = require('express');
+var mongojs = require('mongojs');
+var http = require('http-get');
+var dbc = mongojs('hereandnow');
+var ObjectId = mongojs.ObjectId;
+var collection = dbc.collection('users');
+//For Mongo NearMe
+collection.ensureIndex({ position: '2dsphere' });
+var messageCollection = dbc.collection('messages');
+var router = express.Router();
+
+/* GET home page. */
+router.get('/', function(req, res, next) {
+  res.render('index', { title: 'Express' });
+});
+
+//Facebook Login
+router.post('/fblogin', function(req, res) {
+    //Acceptable Values from client
+	var data = req.body._data;
+
+    //Add Mechanism for checking data from client
+
+
+    //Check if user is under age
+    if(data.dob && getAge(dob)<18){
+        res.json({rc:"success", data: {underage: true}});
+        return;
+    }
+ 
+    //console.log(data);
+	if(data.fb_uid){
+        //Saving Information from facebook
+        var images = data.images;
+        var profile_image = data.images[0];
+
+        //Check if User Exists
+        collection.findOne({ fb_uid: data.fb_uid }, function (err, doc) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            }
+            
+            //New User
+            if (!doc) {
+                data.available = false;
+                data.first_time = true;
+
+                collection.insert(data, function (err, doc) {
+                    if (err) {
+                        res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                        return;
+                    }
+
+                    processUserOutput(doc, function(doc){
+                        res.json({ rc: 'success', data: doc });
+                    });
+                    
+                });
+                return;
+            }
+            
+            //Existing User
+            collection.update({ fb_uid: data.fb_uid }, { $set: data }, function (err) {
+                if (err) {
+                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                    return;
+                }
+                
+                //Returning data to the client
+                collection.findOne({ fb_uid: data.fb_uid }, function (err, doc) {
+                    if (err) {
+                        res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                        return;
+                    }
+                    
+                    processUserOutput(doc, function(doc){
+                        res.json({ rc: 'success', data: doc });
+                    });
+                    
+                });
+            });
+        });
+	}
+	else{
+		res.json({rc: "User Not Found"});
+		return;
+	}
+});
+
+//Update User Data
+router.post('/updateUser', function (req, res) {
+    //req.body._data = JSON.parse(req.body._data);
+    var data = {};
+    data.$set = req.body._data;
+
+    updateUser(req, res, data, function (doc) {
+        processUserOutput(doc,function(doc){
+            res.json({ rc: 'success', data: doc });
+        });
+        
+    });
+});
+
+//People Nearby
+router.post('/nearPeople', function (req, res) {
+    updatePosition(req, res, function (doc) {
+        //Add filter for male female
+        var distance = req.body._data.distance ? parseInt(req.body._data.distance) : 0;
+        var limit = req.body._data.limit ? parseInt(req.body._data.limit) : 21;
+        limit = limit ? Math.min(limit + 6, 30) : 1;
+        var skip = req.body._data.skip ? parseInt(req.body._data.skip) : 0;
+        var search = req.body._data.search;
+        console.log("skip "+skip);
+        console.log("limit "+limit);
+        var query = {
+            _id: { $ne: ObjectId(doc._id) },
+            available: true,
+            //$or: [{ phone_status: 'phone-validated' }, { fb_uid: { $exists: 1 } }],
+            position: {
+                /*$nearSphere : {
+                    $geometry: { type: "Point", coordinates: [doc.position.coordinates[0], doc.position.coordinates[1]] },
+                    $minDistance: 0,
+                    $maxDistance: 1000000,
+                }*/
+                $nearSphere : [doc.position.coordinates[0], doc.position.coordinates[1]],
+                $minDistance: 0
+                //$maxDistance: 10/3963.2//For 10 miles
+                //$maxdistance: 777777
+            }
+        };
+        
+        if (distance) {
+            query.position.$maxdistance = distance;
+        }
+        
+       
+        collection.find(query).limit(limit).skip(skip, function (err, docs) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            };
+            
+            var output = [];
+
+            for (var i = 0; i < docs.length; i++) {
+                // if ((docs[i].blocked && docs[i].blocked.indexOf(doc._id.toString()) >= 0) || (doc.blocked && doc.blocked.indexOf(docs[i]._id.toString()) >= 0)) {
+                //     continue;
+                // }
+                //docs[i] = processOtherUserOutput(doc, docs[i]);
+                output.push(docs[i]);
+            }
+
+            res.json({ rc: 'success', data: output });
+        });
+    });
+});
+
+router.post('/connect', function (req, res) {
+	var data = req.body._data;
+	var output = [];
+	console.log(req.body._id);
+	//Updating User's CONNECTION_REQUESTS
+    getUser(req, res, function (doc) {
+        collection.update({ _id: ObjectId(doc._id) }, {$addToSet: {connection_requests: req.body._id}}, function (err) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+                return;
+            }
+            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+                if (err) {
+                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                    return;
+                }
+
+        		output.push(doc);
+
+        		//Updating User's CONNECTION_REQUESTED
+			    data.connection_requested = data._id;
+			    delete data._id;
+
+			    getUser(req, res, function (doc) {
+			        collection.update({ _id: ObjectId(doc._id) }, {$addToSet: {connection_requested: data.connection_requested}}, function (err) {
+			            if (err) {
+			                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+			                return;
+			            }
+			            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+			                if (err) {
+			                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+			                    return;
+			                }
+
+			        		output.push(doc);
+			        		res.json({rc: "success", data: doc});
+			            });
+			        });
+			    });
+            });
+        });
+    });
+});
+
+router.post('/rejectConnection', function (req, res) {
+	var data = req.body._data;
+	var output = [];
+	//Updating User's CONNECTION_REQUESTS
+    getUser(req, res, function (doc) {
+        collection.update({ _id: ObjectId(doc._id) }, {$pull: {connection_requested: req.body._id}}, function (err) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+                return;
+            }
+            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+                if (err) {
+                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                    return;
+                }
+
+        		output.push(doc);
+
+        		//Updating User's CONNECTION_REQUESTED
+			    data.connection_requested = data._id;
+			    delete data._id;
+
+			    getUser(req, res, function (doc) {
+			        collection.update({ _id: ObjectId(doc._id) }, {$pull: {connection_requests: data.connection_requested}}, function (err) {
+			            if (err) {
+			                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+			                return;
+			            }
+			            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+			                if (err) {
+			                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+			                    return;
+			                }
+
+			        		output.push(doc);
+			        		res.json({rc: "success", data: doc});
+			            });
+			        });
+			    });
+            });
+        });
+    });
+});
+
+router.post('/acceptConnection', function (req, res) {
+	var data = req.body._data;
+	var output = [];
+	//Updating User's CONNECTION_REQUESTS
+    getUser(req, res, function (doc) {
+        collection.update({ _id: ObjectId(doc._id) }, {$pull: {connection_requested: req.body._id}, $addToSet: {connected: req.body._id}}, function (err) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+                return;
+            }
+            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+                if (err) {
+                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                    return;
+                }
+
+        		output.push(doc);
+
+        		//Updating User's CONNECTION_REQUESTED
+			    data.connection_requested = data._id;
+			    delete data._id;
+
+			    getUser(req, res, function (doc) {
+			        collection.update({ _id: ObjectId(doc._id) }, {$pull: {connection_requests: data.connection_requested}, $addToSet: {connected: data.connection_requested}}, function (err) {
+			            if (err) {
+			                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+			                return;
+			            }
+			            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+			                if (err) {
+			                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+			                    return;
+			                }
+
+			        		output.push(doc);
+			        		res.json({rc: "success", data: doc});
+			            });
+			        });
+			    });
+            });
+        });
+    });
+});
+
+//Get User Profile
+router.post('/getUserProfile', function (req, res) {
+    getUser(req, res, function (doc) {
+        processUserOutput(doc, function(doc){
+            res.json({ rc: 'success', data: doc });
+        });
+    });
+});
+
+//Send Message
+router.post('/sendMessage', function (req, res) {
+    var sender = req.body._id;
+    var receiver = req.body._data.receiverId;
+    var timestamp = new Date();
+    timestamp.toISOString();
+    var body = req.body._data.body;
+
+    if(!sender || !receiver || !timestamp){
+        res.json({rc: "No sufficient data provided."});
+        return;
+    }
+
+    messageCollection.insert({sender: sender, receiver: receiver, timestamp: timestamp, body: body}, function (err, doc) {
+        if (err) {
+            res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+            return;
+        }
+        
+        res.json({ rc: 'success', data: doc });
+    });
+});
+
+//View Messages
+router.post('/viewMessages', function (req, res) {
+    var id = req.body._id;
+    var user = req.body._data._id;
+
+    if(!id || !user){
+        res.json({rc: "No sufficient data provided."});
+        return;
+    }
+
+    messageCollection.find({$and: [ 
+        {$or: 
+            [
+                {sender: id},
+                {sender: user}
+            ]
+        }, 
+        {$or: 
+            [
+                {receiver: id},
+                {receiver: user}
+            ]
+        }
+        ]}).skip(0, function (err, docs) {
+
+        if (err) {
+            res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+            return;
+        };
+        
+        collection.findOne({ _id: ObjectId(user) }, function (err, doc) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            }
+
+            res.json({ rc: 'success', data: {user_detail: doc, messages: docs }});
+        });
+    });
+});
+
+
+//Updating Existing user
+function updateUser(req, res, data, successcb) {
+    getUser(req, res, function (doc) {
+        if(data.$set._id){
+            delete data.$set._id;
+        }
+
+        collection.update({ _id: ObjectId(doc._id) }, data, function (err) {
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message, errors: { validation_code: 'Error updating user' } });
+                return;
+            }
+            collection.findOne({ _id: ObjectId(doc._id) }, function (err, doc) {
+                if (err) {
+                    res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                    return;
+                }
+
+                successcb && successcb(doc);
+            });
+        });
+    });
+}
+
+//Getting User Profile
+function getUser(req, res, successcb) {
+    var userKey = req.body._id;
+    
+    if (!userKey) {
+        console.log("No UserKey");
+        res.json({ rc: 'login-error' });
+        return;
+    }
+    
+    var _id = req.body._data && req.body._data._id ? req.body._data._id : userKey;
+    var self = !req.body._data._id;
+
+    if (_id == null) {
+        console.log("Id is null");
+        res.json({ rc: self ? 'login-error' : 'user-not-found' });
+        return;
+    }
+
+    try {
+        _id = ObjectId(_id);
+    } catch (e) {
+        res.json({ rc: self ? 'login-error' : 'user-not-found' });
+        return;
+    }
+    
+    collection.findOne({ _id: _id }, function (err, doc) {
+        if (err) {
+            res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+            return;
+        }
+
+        if (!doc) {
+            res.json({ rc: self ? 'login-error' : 'user-not-found' });
+            return;
+        }
+        //console.log(doc);
+        successcb ? successcb(doc) : res.json({ rc: 'success', data: doc });
+    });
+}
+
+//Update Position
+function updatePosition(req, res, callback) {
+    getUser(req, res, function (doc) {
+        var latitude = parseFloat(req.body._data.latitude);
+        var longitude = parseFloat(req.body._data.longitude);
+        
+        var data = {};
+        var point = [longitude, latitude];
+
+        data.$set = {
+            position: { type: "Point", coordinates: point },
+            location_position: { type: "Point", coordinates: point },
+            location: req.body._data.location,
+            location_update_date: new Date()
+        };
+
+        updateUser(req, res, data, callback);
+    });
+}
+
+//Process User Output
+function processUserOutput(doc,cb) {
+    var connection_requested, connection_requests, connected = [];
+
+    doc.connection_requests ? connection_requests = doc.connection_requests : console.log("else");
+    doc.connected ? connected = doc.connected : console.log("else");
+    doc.connection_requested ? connection_requested = doc.connection_requested : console.log("else");
+
+    delete doc.password;
+    delete doc.fb_access_token;
+    
+    doc.age = doc.date_of_birth ? getAge(doc.date_of_birth) : '';
+
+    doc._id = doc._id.toString();
+    //doc.code = globals.encrypt('_id',doc.code);
+    
+    doc.images_count = doc.images ? doc.images.length : 0;
+
+    function checkEnd(){
+        if(connected === true || connected.length===0 && connection_requests === true || connection_requests.length===0 && connection_requested === true || connection_requested.length===0){
+            cb && cb(doc);
+        }
+    }
+
+    if(connected){
+        for(i = 0; i<connected.length; i++){
+            connected[i] = ObjectId(connected[i]);
+        }
+
+        collection.find({_id: {$in: connected}}, function(err,docs){
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            };
+
+            doc.connected = docs;
+            connected = true;
+            checkEnd();
+        });
+    }
+
+    //Getting Connection Requests
+    if(connection_requests){
+        for(i = 0; i<connection_requests.length; i++){
+            connection_requests[i] = ObjectId(connection_requests[i]);
+        }
+
+        collection.find({_id: {$in: connection_requests}}, function(err,docs){
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            };
+
+            doc.connection_requests = docs;
+            connection_requests = true;
+            checkEnd();
+        });
+    }
+
+
+    //Getting Connection Requests
+    if(connection_requested){
+        for(i = 0; i<connection_requested.length; i++){
+            connection_requested[i] = ObjectId(connection_requested[i]);
+        }
+
+        collection.find({_id: {$in: connection_requested}}, function(err,docs){
+            if (err) {
+                res.json({ rc: err.name + '[' + err.code + ']' + err.message });
+                return;
+            };
+
+            doc.connection_requested = docs;
+            connection_requested = true;
+            checkEnd();
+        });
+    }
+
+
+}
+
+//Getting User Age(Pass MM/DD/YYYY)
+function getAge(birth) {
+    var list = birth.split('/');
+    if (list.length != 3) {
+        return null;
+    }
+
+    var today = new Date();
+    var nowyear = today.getFullYear();
+    var nowmonth = today.getMonth();
+    var nowday = today.getDate();
+        
+    var birthyear = parseInt(list[2]);
+    var birthmonth = parseInt(list[0]);
+    var birthday = parseInt(list[1]);
+        
+    var age = nowyear - birthyear;
+    var age_month = nowmonth - birthmonth;
+    var age_day = nowday - birthday;
+        
+    if (age_month < 0 || (age_month == 0 && age_day < 0)) {
+        age = parseInt(age) - 1;
+    }
+    return age;
+};
+
+module.exports = router;
